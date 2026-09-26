@@ -1,0 +1,15 @@
+node_modules
+.vercel
+.tanstack
+.storybuild
+screenshots
+artifacts
+.grok
+.project_id
+.node_modules.lock
+public/audio
+*.log
+.DS_Store
+dist
+.env
+.env.*
