@@ -186,7 +186,7 @@ export function Library({
       )}
 
       <p className="mt-8 max-w-[46ch] text-sm leading-relaxed text-faint">
-        A voz conta como quem fala com criança, com pausa e carinho. Por baixo, um som leve combina com a história. A ficha fica salva neste aparelho.
+        O próprio celular conta a história em voz alta, com o nome da criança, e um som leve fica por baixo. Não tem cobrança. A ficha fica salva neste aparelho.
       </p>
     </div>
   );

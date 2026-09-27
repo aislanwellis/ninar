@@ -1,28 +1,5 @@
 import { ambience } from "./ambience";
 import { splitSentences, spokenScript, type Story } from "./stories";
-import { loadNarration } from "./voice-cache";
-
-type SpeechChunk = { start: number; text: string; count: number };
-
-function packChunks(sentences: string[]): SpeechChunk[] {
-  const chunks: SpeechChunk[] = [];
-  let buffer: string[] = [];
-  let start = 0;
-  const flush = () => {
-    if (buffer.length === 0) return;
-    chunks.push({ start, text: buffer.join(" "), count: buffer.length });
-    start += buffer.length;
-    buffer = [];
-  };
-  for (const sentence of sentences) {
-    const next = buffer.length === 0 ? sentence.length : buffer.join(" ").length + 1 + sentence.length;
-    if (buffer.length > 0 && next > 1600) flush();
-    buffer.push(sentence);
-  }
-  flush();
-  if (chunks.length > 0) return chunks;
-  return [{ start: 0, text: sentences.join(" "), count: Math.max(sentences.length, 1) }];
-}
 
 export type PlayStatus = "idle" | "playing" | "paused";
 export type NarrationMode = "voice" | "reading";
@@ -67,10 +44,37 @@ const EMPTY: NarratorSnapshot = {
   progress: 0,
 };
 
-function humanRate(rate: number): number {
-  if (rate >= 1.03) return 1.05;
-  if (Math.abs(rate - 0.94) < 0.02 || rate < 0.88) return 0.94;
-  return 1;
+function speechRate(rate: number): number {
+  if (rate >= 1.03) return 1.02;
+  if (rate < 0.97) return 0.92;
+  return 0.98;
+}
+
+function synth(): SpeechSynthesis | null {
+  if (typeof window === "undefined" || !window.speechSynthesis) return null;
+  return window.speechSynthesis;
+}
+
+function pickVoice(): SpeechSynthesisVoice | null {
+  const voices = synth()?.getVoices() ?? [];
+  let best: SpeechSynthesisVoice | null = null;
+  let bestScore = 0;
+  for (const voice of voices) {
+    const name = voice.name.toLowerCase();
+    const lang = voice.lang.toLowerCase().replace("_", "-");
+    let score = 0;
+    if (lang.startsWith("pt-br")) score += 60;
+    else if (lang.startsWith("pt")) score += 24;
+    else continue;
+    if (/francisca|luciana|fernanda|joana|maria|google português|portugues do brasil/.test(name)) score += 30;
+    if (/natural|neural|premium|enhanced|online/.test(name)) score += 20;
+    if (/male|daniel|antonio|grandad/.test(name)) score -= 12;
+    if (score > bestScore) {
+      best = voice;
+      bestScore = score;
+    }
+  }
+  return best;
 }
 
 export class Narrator {
@@ -80,25 +84,31 @@ export class Narrator {
   private index = 0;
   private mode: NarrationMode | null = null;
   private preparing = false;
+  private voiceName: string | null = null;
   private deadline: number | null = null;
   private pausedRemaining: number | null = null;
   private sessionArmed = false;
   private playToken = 0;
+  private speakGen = 0;
   private readTimer = 0;
   private tickTimer = 0;
+  private keepAlive = 0;
   private disposed = false;
-  private audio: HTMLAudioElement | null = null;
-  private objectUrl: string | null = null;
-  private chunks: SpeechChunk[] = [];
-  private chunkIndex = 0;
+  private queuedRate = 0;
+  private queuedVolume = 0;
+  private heard = false;
+  private silentSince = 0;
 
-  constructor(private readonly handlers: Handlers) {}
+  constructor(private readonly handlers: Handlers) {
+    synth()?.getVoices();
+  }
 
   dispose() {
     this.disposed = true;
     this.playToken += 1;
+    this.speakGen += 1;
     this.clearTimers();
-    this.stopAudio();
+    synth()?.cancel();
     ambience.stop();
   }
 
@@ -112,7 +122,7 @@ export class Narrator {
       sentences: this.sentences,
       mode: this.mode,
       preparing: this.preparing,
-      voiceName: null,
+      voiceName: this.voiceName,
       remainingMs: this.remainingMs(),
       progress: this.progress(),
     };
@@ -122,21 +132,18 @@ export class Narrator {
     if (this.disposed) return;
     this.playToken += 1;
     this.clearReadTimer();
-    this.stopAudio();
+    synth()?.cancel();
+    this.heard = false;
     this.story = story;
     this.sentences = splitSentences(spokenScript(story));
-    this.chunks = packChunks(this.sentences);
     this.index = Math.min(Math.max(fromIndex, 0), Math.max(this.sentences.length - 1, 0));
-    this.chunkIndex = Math.max(0, this.chunks.findIndex((chunk) => this.index < chunk.start + chunk.count));
     this.status = "playing";
     this.mode = "voice";
-    this.preparing = true;
+    this.preparing = false;
     this.armSessionTimer();
     this.armTick();
     ambience.start(story.theme);
-    this.emit();
-    const chunk = this.chunks[this.chunkIndex];
-    void this.playChunk(this.playToken, chunk ? this.index - chunk.start : 0);
+    this.speakFrom(this.index);
   }
 
   pause() {
@@ -147,7 +154,7 @@ export class Narrator {
       this.deadline = null;
     }
     this.clearReadTimer();
-    this.audio?.pause();
+    if (this.mode === "voice") synth()?.pause();
     ambience.pause();
     this.emit();
   }
@@ -159,10 +166,12 @@ export class Narrator {
       this.deadline = Date.now() + this.pausedRemaining;
       this.pausedRemaining = null;
     }
-    if (this.mode === "voice" && this.audio && this.audio.src) {
+    ambience.resume();
+    const voice = synth();
+    if (this.mode === "voice" && voice) {
+      if (voice.paused) voice.resume();
+      else if (!voice.speaking) this.speakFrom(this.index);
       this.syncMix();
-      ambience.resume();
-      void this.audio.play().catch(() => this.fallbackReading());
       this.emit();
       return;
     }
@@ -171,17 +180,19 @@ export class Narrator {
 
   stop() {
     this.playToken += 1;
+    this.speakGen += 1;
     this.status = "idle";
     this.story = null;
     this.sentences = [];
     this.index = 0;
     this.mode = null;
     this.preparing = false;
+    this.voiceName = null;
     this.deadline = null;
     this.pausedRemaining = null;
     this.sessionArmed = false;
     this.clearReadTimer();
-    this.stopAudio();
+    synth()?.cancel();
     ambience.stop();
     this.emit();
   }
@@ -205,101 +216,69 @@ export class Narrator {
     this.emit();
   }
 
-  private ensureAudio(): HTMLAudioElement {
-    if (this.audio) return this.audio;
-    const audio = new Audio();
-    audio.preload = "auto";
-    audio.preservesPitch = true;
-    audio.addEventListener("timeupdate", () => this.onTime());
-    audio.addEventListener("ended", () => {
-      if (this.status !== "playing" || this.mode !== "voice") return;
-      this.advanceChunk();
-    });
-    this.audio = audio;
-    return audio;
-  }
-
-  private advanceChunk() {
-    const next = this.chunkIndex + 1;
-    if (next < this.chunks.length) {
-      this.chunkIndex = next;
-      this.index = this.chunks[next]?.start ?? this.index;
-      this.preparing = true;
-      this.emit();
-      void this.playChunk(this.playToken, 0);
+  private speakFrom(fromIndex: number) {
+    const voiceBox = synth();
+    if (!voiceBox || this.sentences.length === 0) {
+      this.fallbackReading();
       return;
     }
-    ambience.stop();
-    this.finishStory();
-  }
-
-  private async playChunk(token: number, localIndex: number) {
-    const chunk = this.chunks[this.chunkIndex];
-    if (!chunk) return;
-    try {
-      const blob = await loadNarration(chunk.text);
-      if (this.disposed || token !== this.playToken) return;
-      if (this.status !== "playing" && this.status !== "paused") return;
-      const audio = this.ensureAudio();
-      this.preparing = false;
-      const url = URL.createObjectURL(blob);
-      if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
-      this.objectUrl = url;
-      audio.src = url;
-      await new Promise<void>((resolve, reject) => {
-        const ok = () => {
-          cleanup();
-          resolve();
-        };
-        const bad = () => {
-          cleanup();
-          reject(new Error("audio"));
-        };
-        const cleanup = () => {
-          audio.removeEventListener("loadedmetadata", ok);
-          audio.removeEventListener("error", bad);
-        };
-        if (audio.readyState >= 1 && Number.isFinite(audio.duration)) ok();
-        else {
-          audio.addEventListener("loadedmetadata", ok);
-          audio.addEventListener("error", bad);
+    this.speakGen += 1;
+    const gen = this.speakGen;
+    this.silentSince = 0;
+    voiceBox.cancel();
+    const voice = pickVoice();
+    this.voiceName = voice?.name ?? "Voz do celular";
+    this.mode = "voice";
+    this.preparing = false;
+    const settings = this.handlers.getSettings();
+    const rate = speechRate(settings.rate);
+    const volume = Math.max(0, Math.min(1, settings.volume));
+    this.queuedRate = rate;
+    this.queuedVolume = volume;
+    this.index = fromIndex;
+    for (let i = fromIndex; i < this.sentences.length; i += 1) {
+      const sentence = this.sentences[i]?.trim();
+      if (!sentence) continue;
+      const utterance = new SpeechSynthesisUtterance(sentence);
+      utterance.lang = "pt-BR";
+      utterance.rate = rate;
+      utterance.pitch = 1;
+      utterance.volume = volume;
+      if (voice) utterance.voice = voice;
+      utterance.onstart = () => {
+        if (this.disposed || gen !== this.speakGen) return;
+        this.index = i;
+        this.preparing = false;
+        this.heard = true;
+        if (this.remainingMs() === 0) {
+          this.finishTimer();
+          return;
         }
-      });
-      if (this.disposed || token !== this.playToken) return;
-      if (this.status !== "playing" && this.status !== "paused") return;
-      if (localIndex > 0) audio.currentTime = this.timeForLocal(localIndex);
-      this.syncMix();
-      this.prefetch();
-      this.emit();
-      if (this.status === "playing") await audio.play();
-    } catch {
-      if (this.disposed || token !== this.playToken || this.status === "idle") return;
-      this.preparing = false;
-      this.fallbackReading();
+        this.emit();
+      };
+      utterance.onend = () => {
+        if (this.disposed || gen !== this.speakGen || this.status !== "playing") return;
+        if (i >= this.sentences.length - 1) this.finishStory();
+      };
+      utterance.onerror = (event) => {
+        const reason = event.error;
+        if (reason === "interrupted" || reason === "canceled") return;
+        if (this.disposed || gen !== this.speakGen || this.status === "idle") return;
+        const live = synth();
+        if (live && (live.speaking || live.pending)) return;
+        this.fallbackReading();
+      };
+      voiceBox.speak(utterance);
     }
-  }
-
-  private prefetch() {
-    const next = this.chunks[this.chunkIndex + 1];
-    if (!next) return;
-    void loadNarration(next.text).catch(() => {});
-  }
-
-  private onTime() {
-    const audio = this.audio;
-    if (!audio || this.status !== "playing" || this.mode !== "voice") return;
+    this.armKeepAlive();
     this.syncMix();
-    if (!Number.isFinite(audio.duration) || audio.duration <= 0) return;
-    const next = this.sentenceAt(audio.currentTime);
-    if (next !== this.index) {
-      this.index = next;
-      this.emit();
-    }
+    this.emit();
   }
 
   private fallbackReading() {
     this.mode = "reading";
-    this.audio?.pause();
+    this.preparing = false;
+    synth()?.cancel();
     this.speakReading();
   }
 
@@ -317,7 +296,7 @@ export class Narrator {
     this.clearReadTimer();
     this.emit();
     const words = sentence.split(/\s+/).length;
-    const ms = Math.max(1200, words * (380 / humanRate(this.handlers.getSettings().rate)));
+    const ms = Math.max(1200, words * (380 / speechRate(this.handlers.getSettings().rate)));
     this.readTimer = window.setTimeout(() => {
       if (this.status !== "playing" || this.mode !== "reading") return;
       this.advanceReading();
@@ -337,52 +316,19 @@ export class Narrator {
     this.speakReading();
   }
 
-  private chunkSentences(): string[] {
-    const chunk = this.chunks[this.chunkIndex];
-    if (!chunk) return this.sentences;
-    return this.sentences.slice(chunk.start, chunk.start + chunk.count);
-  }
-
-  private timeForLocal(localIndex: number): number {
-    const duration = this.audio?.duration ?? 0;
-    if (!duration) return 0;
-    const weights = this.chunkSentences().map((sentence) => Math.max(sentence.length, 1));
-    const total = weights.reduce((sum, weight) => sum + weight, 0) || 1;
-    const before = weights.slice(0, localIndex).reduce((sum, weight) => sum + weight, 0);
-    return (before / total) * duration;
-  }
-
-  private sentenceAt(time: number): number {
-    const chunk = this.chunks[this.chunkIndex];
-    const duration = this.audio?.duration ?? 0;
-    if (!chunk || !duration) return this.index;
-    const weights = this.chunkSentences().map((sentence) => Math.max(sentence.length, 1));
-    const total = weights.reduce((sum, weight) => sum + weight, 0) || 1;
-    let cursor = 0;
-    const target = (time / duration) * total;
-    for (let i = 0; i < weights.length; i += 1) {
-      cursor += weights[i] ?? 0;
-      if (target < cursor) return chunk.start + i;
-    }
-    return chunk.start + Math.max(weights.length - 1, 0);
-  }
-
   private progress(): number {
-    const chunks = Math.max(this.chunks.length, 1);
-    const audio = this.audio;
-    if (this.mode === "voice" && audio && Number.isFinite(audio.duration) && audio.duration > 0) {
-      return Math.min(1, (this.chunkIndex + audio.currentTime / audio.duration) / chunks);
-    }
     if (this.sentences.length === 0) return 0;
     return Math.min(1, this.index / this.sentences.length);
   }
 
   private syncMix() {
-    const audio = this.audio;
-    if (!audio) return;
-    audio.volume = Math.max(0, Math.min(1, this.fadedVolume()));
-    audio.playbackRate = humanRate(this.handlers.getSettings().rate);
-    ambience.setVolume(this.fadedVolume() * 0.82);
+    ambience.setVolume(Math.max(0, Math.min(1, this.fadedVolume())) * 0.45);
+    if (this.mode !== "voice" || this.status !== "playing") return;
+    const settings = this.handlers.getSettings();
+    const rate = speechRate(settings.rate);
+    const volume = Math.max(0, Math.min(1, settings.volume));
+    if (rate === this.queuedRate && Math.abs(volume - this.queuedVolume) < 0.05) return;
+    this.speakFrom(this.index);
   }
 
   private armSessionTimer() {
@@ -414,8 +360,9 @@ export class Narrator {
     const id = this.story?.id;
     this.status = "idle";
     this.playToken += 1;
+    this.speakGen += 1;
     this.clearReadTimer();
-    this.audio?.pause();
+    synth()?.cancel();
     ambience.stop();
     if (this.sentences.length > 0) this.index = this.sentences.length - 1;
     this.emit();
@@ -425,11 +372,12 @@ export class Narrator {
   private finishTimer() {
     this.status = "idle";
     this.playToken += 1;
+    this.speakGen += 1;
     this.deadline = null;
     this.pausedRemaining = null;
     this.sessionArmed = false;
     this.clearReadTimer();
-    this.audio?.pause();
+    synth()?.cancel();
     ambience.stop();
     this.emit();
   }
@@ -438,13 +386,45 @@ export class Narrator {
     if (this.tickTimer) return;
     this.tickTimer = window.setInterval(() => {
       if (this.disposed) return;
-      if (this.status === "playing") this.syncMix();
+      if (this.status === "playing") {
+        this.syncMix();
+        this.recoverVoice();
+      }
       if (this.status === "playing" && this.remainingMs() === 0) {
         this.finishTimer();
         return;
       }
       if (this.status !== "idle") this.emit();
     }, 500);
+  }
+
+  private recoverVoice() {
+    if (this.mode !== "voice" || !this.heard) return;
+    const voice = synth();
+    if (!voice || voice.speaking || voice.paused) {
+      this.silentSince = 0;
+      return;
+    }
+    if (!this.silentSince) {
+      this.silentSince = Date.now();
+      return;
+    }
+    if (Date.now() - this.silentSince < 1600) return;
+    this.silentSince = 0;
+    this.speakFrom(this.index);
+  }
+
+  private armKeepAlive() {
+    if (this.keepAlive) return;
+    const ios = typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent);
+    if (ios) return;
+    this.keepAlive = window.setInterval(() => {
+      const voice = synth();
+      if (!voice || this.disposed || this.status !== "playing" || this.mode !== "voice") return;
+      if (!voice.speaking || voice.paused) return;
+      voice.pause();
+      voice.resume();
+    }, 12000);
   }
 
   private clearReadTimer() {
@@ -455,17 +435,9 @@ export class Narrator {
   private clearTimers() {
     this.clearReadTimer();
     if (this.tickTimer) window.clearInterval(this.tickTimer);
+    if (this.keepAlive) window.clearInterval(this.keepAlive);
     this.tickTimer = 0;
-  }
-
-  private stopAudio() {
-    const audio = this.audio;
-    if (!audio) return;
-    audio.pause();
-    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
-    this.objectUrl = null;
-    audio.removeAttribute("src");
-    audio.load();
+    this.keepAlive = 0;
   }
 
   private emit() {
