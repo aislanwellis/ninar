@@ -58,8 +58,8 @@ export function Library({
           <p className="text-center text-sm font-medium text-faint">Ninar</p>
           <h1 className="mt-2 text-center font-display text-3xl leading-tight text-fg">Oi, {childName}!</h1>
           <p className="mx-auto mt-3 max-w-[38ch] text-center text-pretty text-sm leading-relaxed text-muted">
-            Seu amiguinho está aqui. Cinquenta continhos de cinco a sete minutos, com o nome de {childName},
-            voz de contadora e os sons da história. Toque em um e fique juntinho até o soninho chegar.
+            Seu amiguinho está aqui. Cinquenta continhos de cinco a sete minutos, com o nome de {childName}
+            e uma voz brasileira. Toque em um e fique juntinho até o soninho chegar.
           </p>
           <button
             type="button"
@@ -186,7 +186,7 @@ export function Library({
       )}
 
       <p className="mt-8 max-w-[46ch] text-sm leading-relaxed text-faint">
-        O próprio celular conta a história em voz alta, com o nome da criança, e um som leve fica por baixo. Não tem cobrança. A ficha fica salva neste aparelho.
+        Na primeira vez o celular baixa uma voz brasileira, cerca de 20 MB. Depois ela conta a história, com o nome da criança, sem cobrança. A ficha fica salva neste aparelho.
       </p>
     </div>
   );

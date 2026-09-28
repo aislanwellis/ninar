@@ -69,7 +69,9 @@ export function Player({
 
   const statusLine = playing
     ? snap.preparing
-      ? "Preparando a voz"
+      ? snap.voiceName && /Baixando|Abrindo/.test(snap.voiceName)
+        ? snap.voiceName
+        : "Preparando a voz"
       : snap.mode === "reading"
         ? "Texto na tela"
         : "Contando"

@@ -1,4 +1,5 @@
 import { ambience } from "./ambience";
+import { clipFor, loadVoice } from "./neural";
 import { splitSentences, spokenScript, type Story } from "./stories";
 
 export type PlayStatus = "idle" | "playing" | "paused";
@@ -94,8 +95,10 @@ export class Narrator {
   private tickTimer = 0;
   private keepAlive = 0;
   private disposed = false;
-  private queuedRate = 0;
-  private queuedVolume = 0;
+  private audio: HTMLAudioElement | null = null;
+  private objectUrl: string | null = null;
+  private rendering = false;
+  private neural = false;
   private heard = false;
   private silentSince = 0;
 
@@ -109,6 +112,7 @@ export class Narrator {
     this.speakGen += 1;
     this.clearTimers();
     synth()?.cancel();
+    this.stopAudio();
     ambience.stop();
   }
 
@@ -143,7 +147,7 @@ export class Narrator {
     this.armSessionTimer();
     this.armTick();
     ambience.start(story.theme);
-    this.speakFrom(this.index);
+    void this.playNeural(this.index);
   }
 
   pause() {
@@ -154,7 +158,8 @@ export class Narrator {
       this.deadline = null;
     }
     this.clearReadTimer();
-    if (this.mode === "voice") synth()?.pause();
+    if (this.neural) this.audio?.pause();
+    else if (this.mode === "voice") synth()?.pause();
     ambience.pause();
     this.emit();
   }
@@ -167,6 +172,20 @@ export class Narrator {
       this.pausedRemaining = null;
     }
     ambience.resume();
+    if (this.neural) {
+      if (this.rendering) {
+        this.emit();
+        return;
+      }
+      if (this.audio?.src && this.audio.paused) {
+        this.syncMix();
+        void this.audio.play().catch(() => this.speakFrom(this.index));
+        this.emit();
+        return;
+      }
+      void this.playClip(this.playToken, this.index);
+      return;
+    }
     const voice = synth();
     if (this.mode === "voice" && voice) {
       if (voice.paused) voice.resume();
@@ -191,8 +210,11 @@ export class Narrator {
     this.deadline = null;
     this.pausedRemaining = null;
     this.sessionArmed = false;
+    this.neural = false;
+    this.rendering = false;
     this.clearReadTimer();
     synth()?.cancel();
+    this.stopAudio();
     ambience.stop();
     this.emit();
   }
@@ -216,6 +238,108 @@ export class Narrator {
     this.emit();
   }
 
+  private async playNeural(fromIndex: number) {
+    const token = this.playToken;
+    this.neural = true;
+    this.preparing = true;
+    this.voiceName = "Preparando a voz";
+    this.mode = "voice";
+    this.index = fromIndex;
+    synth()?.cancel();
+    this.stopAudio();
+    this.emit();
+    try {
+      await loadVoice((label) => {
+        if (this.disposed || token !== this.playToken) return;
+        this.voiceName = label;
+        this.preparing = true;
+        this.emit();
+      });
+    } catch {
+      if (token === this.playToken) this.speakFrom(fromIndex);
+      return;
+    }
+    if (this.disposed || token !== this.playToken) return;
+    void this.playClip(token, fromIndex);
+  }
+
+  private async playClip(token: number, index: number) {
+    if (this.disposed || token !== this.playToken || !this.story) return;
+    if (this.status !== "playing" && this.status !== "paused") return;
+    if (this.remainingMs() === 0) {
+      this.finishTimer();
+      return;
+    }
+    if (index >= this.sentences.length) {
+      this.finishStory();
+      return;
+    }
+    const sentence = this.sentences[index]?.trim();
+    if (!sentence) {
+      void this.playClip(token, index + 1);
+      return;
+    }
+    this.index = index;
+    this.preparing = true;
+    this.neural = true;
+    this.emit();
+    const speed = speechRate(this.handlers.getSettings().rate);
+    const next = this.sentences[index + 1]?.trim();
+    if (next) void clipFor(this.story.id, next, speed).catch(() => {});
+    this.rendering = true;
+    let blob: Blob;
+    try {
+      blob = await clipFor(this.story.id, sentence, speed);
+    } catch {
+      this.rendering = false;
+      if (token === this.playToken) this.speakFrom(index);
+      return;
+    }
+    this.rendering = false;
+    if (this.disposed || token !== this.playToken || !this.neural) return;
+    if (this.status !== "playing" && this.status !== "paused") return;
+    const audio = this.ensureAudio();
+    audio.onended = null;
+    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
+    const url = URL.createObjectURL(blob);
+    this.objectUrl = url;
+    audio.src = url;
+    this.preparing = false;
+    this.heard = true;
+    this.voiceName = "Voz brasileira";
+    this.syncMix();
+    this.emit();
+    audio.onended = () => {
+      if (this.disposed || token !== this.playToken || !this.neural || this.status !== "playing") return;
+      void this.playClip(token, index + 1);
+    };
+    if (this.status !== "playing") return;
+    try {
+      await audio.play();
+    } catch {
+      if (token === this.playToken) this.speakFrom(index);
+    }
+  }
+
+  private ensureAudio(): HTMLAudioElement {
+    if (this.audio) return this.audio;
+    const audio = new Audio();
+    audio.preload = "auto";
+    this.audio = audio;
+    return audio;
+  }
+
+  private stopAudio() {
+    const audio = this.audio;
+    if (!audio) return;
+    audio.onended = null;
+    audio.pause();
+    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
+    this.objectUrl = null;
+    audio.removeAttribute("src");
+    audio.load();
+  }
+
   private speakFrom(fromIndex: number) {
     const voiceBox = synth();
     if (!voiceBox || this.sentences.length === 0) {
@@ -226,6 +350,8 @@ export class Narrator {
     const gen = this.speakGen;
     this.silentSince = 0;
     voiceBox.cancel();
+    this.neural = false;
+    this.stopAudio();
     const voice = pickVoice();
     this.voiceName = voice?.name ?? "Voz do celular";
     this.mode = "voice";
@@ -233,8 +359,6 @@ export class Narrator {
     const settings = this.handlers.getSettings();
     const rate = speechRate(settings.rate);
     const volume = Math.max(0, Math.min(1, settings.volume));
-    this.queuedRate = rate;
-    this.queuedVolume = volume;
     this.index = fromIndex;
     for (let i = fromIndex; i < this.sentences.length; i += 1) {
       const sentence = this.sentences[i]?.trim();
@@ -322,13 +446,12 @@ export class Narrator {
   }
 
   private syncMix() {
-    ambience.setVolume(Math.max(0, Math.min(1, this.fadedVolume())) * 0.45);
-    if (this.mode !== "voice" || this.status !== "playing") return;
-    const settings = this.handlers.getSettings();
-    const rate = speechRate(settings.rate);
-    const volume = Math.max(0, Math.min(1, settings.volume));
-    if (rate === this.queuedRate && Math.abs(volume - this.queuedVolume) < 0.05) return;
-    this.speakFrom(this.index);
+    const level = Math.max(0, Math.min(1, this.fadedVolume()));
+    ambience.setVolume(level * 0.45);
+    const audio = this.audio;
+    if (!audio) return;
+    audio.volume = level;
+    audio.playbackRate = speechRate(this.handlers.getSettings().rate);
   }
 
   private armSessionTimer() {
@@ -363,6 +486,7 @@ export class Narrator {
     this.speakGen += 1;
     this.clearReadTimer();
     synth()?.cancel();
+    this.stopAudio();
     ambience.stop();
     if (this.sentences.length > 0) this.index = this.sentences.length - 1;
     this.emit();
@@ -376,8 +500,10 @@ export class Narrator {
     this.deadline = null;
     this.pausedRemaining = null;
     this.sessionArmed = false;
+    this.neural = false;
     this.clearReadTimer();
     synth()?.cancel();
+    this.stopAudio();
     ambience.stop();
     this.emit();
   }
@@ -399,7 +525,7 @@ export class Narrator {
   }
 
   private recoverVoice() {
-    if (this.mode !== "voice" || !this.heard) return;
+    if (this.neural || this.mode !== "voice" || !this.heard) return;
     const voice = synth();
     if (!voice || voice.speaking || voice.paused) {
       this.silentSince = 0;
